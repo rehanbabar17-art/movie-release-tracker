@@ -3,7 +3,7 @@ import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3
 
 type Movie = { title: string; tmdbId: number; releases?: Array<'cinema' | 'digital'> };
 type SeasonRequest = number | { seasonNumber?: number; seasonName?: string; number?: number; name?: string };
-type Show = { title: string; tmdbId: number; seasons?: SeasonRequest[] };
+type Show = { title: string; tmdbId?: number | null; tmdb_id?: number | null; seasons?: SeasonRequest[] };
 type Config = { region: string; ntfy: { server: string; topic: string }; movies: Movie[]; shows: Show[] };
 type Release = { id: string; title: string; kind: 'cinema' | 'digital' | 'episode' | 'season'; date: string; detail: string; url: string };
 type State = { checkedAt?: string; releases: Release[]; notified: string[] };
@@ -40,6 +40,19 @@ export function resolveSeason(request: SeasonRequest, available: TmdbSeason[]): 
   const best = ranked[0];
   return best && best.distance <= Math.max(2, Math.floor(requestedName.length * 0.25)) ? best.season : undefined;
 }
+function normalizedTitle(title = '') { return title.toLocaleLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, ' ').trim(); }
+async function ensureShowTmdbId(show: Show): Promise<number> {
+  const existing = show.tmdbId ?? show.tmdb_id;
+  if (Number.isInteger(existing) && (existing as number) > 0) return existing as number;
+  if (!show.title?.trim()) throw new Error('A show in the B2 config has no TMDB ID and no title to resolve. Add its title and rerun.');
+  const result = await tmdb<{ results: Array<{ id: number; name?: string; original_name?: string }> }>(`/search/tv?query=${encodeURIComponent(show.title)}`);
+  const exact = (result.results || []).filter(item => normalizedTitle(item.name || '') === normalizedTitle(show.title) || normalizedTitle(item.original_name || '') === normalizedTitle(show.title));
+  if (exact.length !== 1) throw new Error(`Show "${show.title}" has no valid TMDB ID and TMDB title matching was ${exact.length ? 'ambiguous' : 'unsuccessful'}. Add the correct numeric tmdbId in B2.`);
+  show.tmdbId = exact[0].id;
+  delete show.tmdb_id;
+  console.log(`Resolved missing TMDB ID for show "${show.title}" and will save it to B2.`);
+  return exact[0].id;
+}
 type ReminderStage = 30 | 7 | 3;
 export function getReminderStage(releaseDate: string, today = new Date().toISOString().slice(0, 10)): ReminderStage | null {
   const daysUntil = Math.round((Date.parse(`${releaseDate}T00:00:00Z`) - Date.parse(`${today}T00:00:00Z`)) / 86_400_000);
@@ -75,7 +88,8 @@ export async function checkReleases() {
     }
   }
   for (const show of config.shows || []) {
-    const info = await tmdb<{ name?: string; seasons?: TmdbSeason[] }>(`/tv/${show.tmdbId}`);
+    const showId = await ensureShowTmdbId(show);
+    const info = await tmdb<{ name?: string; seasons?: TmdbSeason[] }>(`/tv/${showId}`);
     const available = (info.seasons || []).filter(s => s.season_number > 0);
     const requests: SeasonRequest[] = show.seasons?.length ? show.seasons : available.map(s => s.season_number);
     const canonicalRequests: SeasonRequest[] = [];
@@ -89,13 +103,13 @@ export async function checkReleases() {
       }
       const sn = seasonMeta.season_number;
       canonicalRequests.push({ seasonNumber: sn, seasonName: seasonMeta.name });
-      const season = await tmdb<{ name?: string; air_date?: string | null; episodes?: Array<{ id: number; name: string; episode_number: number; air_date?: string }> }>(`/tv/${show.tmdbId}/season/${sn}`);
+      const season = await tmdb<{ name?: string; air_date?: string | null; episodes?: Array<{ id: number; name: string; episode_number: number; air_date?: string }> }>(`/tv/${showId}/season/${sn}`);
       const seasonName = season.name || seasonMeta.name || `Season ${sn}`;
       const seasonReleaseDate = dateOnly(season.air_date || seasonMeta.air_date || undefined);
-      if (seasonReleaseDate) found.push({ id: `season-${show.tmdbId}-${sn}-${seasonReleaseDate}`, title: show.title, kind: 'season', date: seasonReleaseDate, detail: `Season ${sn}: ${seasonName} premiere`, url: `https://www.themoviedb.org/tv/${show.tmdbId}/season/${sn}` });
+      if (seasonReleaseDate) found.push({ id: `season-${showId}-${sn}-${seasonReleaseDate}`, title: show.title, kind: 'season', date: seasonReleaseDate, detail: `Season ${sn}: ${seasonName} premiere`, url: `https://www.themoviedb.org/tv/${showId}/season/${sn}` });
       for (const ep of season.episodes || []) {
         const date = dateOnly(ep.air_date); if (!date) continue;
-        found.push({ id: `episode-${ep.id}-${date}`, title: show.title, kind: 'episode', date, detail: `${seasonName}, Episode ${ep.episode_number}: ${ep.name}`, url: `https://www.themoviedb.org/tv/${show.tmdbId}/season/${sn}` });
+        found.push({ id: `episode-${ep.id}-${date}`, title: show.title, kind: 'episode', date, detail: `${seasonName}, Episode ${ep.episode_number}: ${ep.name}`, url: `https://www.themoviedb.org/tv/${showId}/season/${sn}` });
       }
     }
     if (show.seasons?.length) show.seasons = [...new Map(canonicalRequests.map((s, i) => [typeof s === 'number' ? s : s.seasonNumber ?? s.number ?? i, s])).values()];
