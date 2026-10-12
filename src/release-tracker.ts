@@ -1,9 +1,9 @@
 import 'dotenv/config';
 import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 
-type Movie = { title: string; tmdbId: number; releases?: Array<'cinema' | 'digital'> };
+type Movie = { title?: string; name?: string; tmdbId?: number | null; tmdb_id?: number | null; releases?: Array<'cinema' | 'digital'> };
 type SeasonRequest = number | { seasonNumber?: number; seasonName?: string; number?: number; name?: string };
-type Show = { title: string; tmdbId?: number | null; tmdb_id?: number | null; seasons?: SeasonRequest[] };
+type Show = { title?: string; name?: string; tmdbId?: number | null; tmdb_id?: number | null; seasons?: SeasonRequest[] };
 type Config = { region: string; ntfy: { server: string; topic: string }; movies: Movie[]; shows: Show[] };
 type Release = { id: string; title: string; kind: 'cinema' | 'digital' | 'episode' | 'season'; date: string; detail: string; url: string };
 type State = { checkedAt?: string; releases: Release[]; notified: string[] };
@@ -41,17 +41,46 @@ export function resolveSeason(request: SeasonRequest, available: TmdbSeason[]): 
   return best && best.distance <= Math.max(2, Math.floor(requestedName.length * 0.25)) ? best.season : undefined;
 }
 function normalizedTitle(title = '') { return title.toLocaleLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, ' ').trim(); }
-async function ensureShowTmdbId(show: Show): Promise<number> {
-  const existing = show.tmdbId ?? show.tmdb_id;
-  if (Number.isInteger(existing) && (existing as number) > 0) return existing as number;
-  if (!show.title?.trim()) throw new Error('A show in the B2 config has no TMDB ID and no title to resolve. Add its title and rerun.');
-  const result = await tmdb<{ results: Array<{ id: number; name?: string; original_name?: string }> }>(`/search/tv?query=${encodeURIComponent(show.title)}`);
-  const exact = (result.results || []).filter(item => normalizedTitle(item.name || '') === normalizedTitle(show.title) || normalizedTitle(item.original_name || '') === normalizedTitle(show.title));
-  if (exact.length !== 1) throw new Error(`Show "${show.title}" has no valid TMDB ID and TMDB title matching was ${exact.length ? 'ambiguous' : 'unsuccessful'}. Add the correct numeric tmdbId in B2.`);
-  show.tmdbId = exact[0].id;
-  delete show.tmdb_id;
-  console.log(`Resolved missing TMDB ID for show "${show.title}" and will save it to B2.`);
-  return exact[0].id;
+type SearchCandidate = { id: number; title?: string; original_title?: string; name?: string; original_name?: string; popularity?: number };
+export function chooseTitleMatch<T extends SearchCandidate>(query: string, results: T[]): T | undefined {
+  const q = normalizedTitle(query);
+  if (!q) return undefined;
+  const exact = results.filter(item => [item.title, item.original_title, item.name, item.original_name].some(value => normalizedTitle(value || '') === q));
+  if (exact.length) return exact.sort((a, b) => (b.popularity || 0) - (a.popularity || 0))[0];
+  const ranked = results.map(item => {
+    const names = [item.title, item.original_title, item.name, item.original_name].filter(Boolean).map(value => normalizedTitle(value!));
+    return { item, distance: Math.min(...names.map(name => editDistance(q, name))) };
+  }).sort((a, b) => a.distance - b.distance || (b.item.popularity || 0) - (a.item.popularity || 0));
+  const best = ranked[0];
+  return best && best.distance <= Math.max(2, Math.floor(q.length * 0.22)) ? best.item : undefined;
+}
+async function ensureCatalogId(kind: 'movie' | 'tv', item: Movie | Show): Promise<number | undefined> {
+  const enteredTitle = (item.title || item.name || '').trim();
+  const existing = item.tmdbId ?? item.tmdb_id;
+  if (Number.isInteger(existing) && (existing as number) > 0) {
+    item.tmdbId = existing as number;
+    delete item.tmdb_id;
+    if (!item.title && item.name) item.title = item.name;
+    return existing as number;
+  }
+  if (!enteredTitle) {
+    console.warn(`Skipping a ${kind} entry with no title or TMDB ID; add at least a title in B2.`);
+    return undefined;
+  }
+  const result = kind === 'movie'
+    ? await tmdb<{ results: SearchCandidate[] }>(`/search/movie?query=${encodeURIComponent(enteredTitle)}`)
+    : await tmdb<{ results: SearchCandidate[] }>(`/search/tv?query=${encodeURIComponent(enteredTitle)}`);
+  const candidate = chooseTitleMatch(enteredTitle, result.results || []);
+  if (!candidate) {
+    console.warn(`Could not match ${kind} "${enteredTitle}" to TMDB; leaving it in B2 and skipping it this run.`);
+    return undefined;
+  }
+  item.tmdbId = candidate.id;
+  item.title = (kind === 'movie' ? candidate.title || candidate.original_title : candidate.name || candidate.original_name) || enteredTitle;
+  delete item.name;
+  delete item.tmdb_id;
+  console.log(`Resolved ${kind} "${enteredTitle}" as "${item.title}" (TMDB ID ${candidate.id}); saving the match to B2.`);
+  return candidate.id;
 }
 type ReminderStage = 30 | 7 | 3;
 export function getReminderStage(releaseDate: string, today = new Date().toISOString().slice(0, 10)): ReminderStage | null {
@@ -78,18 +107,24 @@ export async function checkReleases() {
   const region = (config.region || process.env.RELEASE_REGION || 'US').toUpperCase();
   const found: Release[] = [];
   for (const m of config.movies || []) {
-    const data = await tmdb<{ results: Array<{ iso_3166_1: string; release_dates: Array<{ release_date: string; type: number; note?: string }> }> }>(`/movie/${m.tmdbId}/release_dates`);
+    const movieId = await ensureCatalogId('movie', m);
+    if (!movieId) continue;
+    const movieTitle = m.title || m.name || `Movie ${movieId}`;
+    const data = await tmdb<{ results: Array<{ iso_3166_1: string; release_dates: Array<{ release_date: string; type: number; note?: string }> }> }>(`/movie/${movieId}/release_dates`);
     const country = data.results.find(x => x.iso_3166_1 === region);
     for (const r of country?.release_dates || []) {
       const kind = ([2, 3].includes(r.type) ? 'cinema' : [4, 7].includes(r.type) ? 'digital' : null) as 'cinema' | 'digital' | null;
       if (!kind || (m.releases?.length && !m.releases.includes(kind))) continue;
       const date = dateOnly(r.release_date); if (!date) continue;
-      found.push({ id: `movie-${m.tmdbId}-${kind}-${date}`, title: m.title, kind, date, detail: r.note || (kind === 'cinema' ? `Cinema release · ${region}` : `Digital release · ${region}`), url: `https://www.themoviedb.org/movie/${m.tmdbId}` });
+      found.push({ id: `movie-${movieId}-${kind}-${date}`, title: movieTitle, kind, date, detail: r.note || (kind === 'cinema' ? `Cinema release · ${region}` : `Digital release · ${region}`), url: `https://www.themoviedb.org/movie/${movieId}` });
     }
   }
   for (const show of config.shows || []) {
-    const showId = await ensureShowTmdbId(show);
+    const showId = await ensureCatalogId('tv', show);
+    if (!showId) continue;
     const info = await tmdb<{ name?: string; seasons?: TmdbSeason[] }>(`/tv/${showId}`);
+    if (info.name) show.title = info.name;
+    const showTitle = show.title || show.name || `Series ${showId}`;
     const available = (info.seasons || []).filter(s => s.season_number > 0);
     const requests: SeasonRequest[] = show.seasons?.length ? show.seasons : available.map(s => s.season_number);
     const canonicalRequests: SeasonRequest[] = [];
@@ -97,7 +132,7 @@ export async function checkReleases() {
       const seasonMeta = resolveSeason(request, available);
       if (!seasonMeta) {
         const entered = typeof request === 'number' ? `season ${request}` : (request.seasonName ?? request.name ?? `season ${request.seasonNumber ?? request.number ?? '?'}`);
-        console.warn(`Could not match ${show.title} entry "${entered}" to a TMDB season; leaving it unchanged in B2.`);
+        console.warn(`Could not match ${showTitle} entry "${entered}" to a TMDB season; leaving it unchanged in B2.`);
         canonicalRequests.push(request);
         continue;
       }
@@ -106,10 +141,10 @@ export async function checkReleases() {
       const season = await tmdb<{ name?: string; air_date?: string | null; episodes?: Array<{ id: number; name: string; episode_number: number; air_date?: string }> }>(`/tv/${showId}/season/${sn}`);
       const seasonName = season.name || seasonMeta.name || `Season ${sn}`;
       const seasonReleaseDate = dateOnly(season.air_date || seasonMeta.air_date || undefined);
-      if (seasonReleaseDate) found.push({ id: `season-${showId}-${sn}-${seasonReleaseDate}`, title: show.title, kind: 'season', date: seasonReleaseDate, detail: `Season ${sn}: ${seasonName} premiere`, url: `https://www.themoviedb.org/tv/${showId}/season/${sn}` });
+      if (seasonReleaseDate) found.push({ id: `season-${showId}-${sn}-${seasonReleaseDate}`, title: showTitle, kind: 'season', date: seasonReleaseDate, detail: `Season ${sn}: ${seasonName} premiere`, url: `https://www.themoviedb.org/tv/${showId}/season/${sn}` });
       for (const ep of season.episodes || []) {
         const date = dateOnly(ep.air_date); if (!date) continue;
-        found.push({ id: `episode-${ep.id}-${date}`, title: show.title, kind: 'episode', date, detail: `${seasonName}, Episode ${ep.episode_number}: ${ep.name}`, url: `https://www.themoviedb.org/tv/${showId}/season/${sn}` });
+        found.push({ id: `episode-${ep.id}-${date}`, title: showTitle, kind: 'episode', date, detail: `${seasonName}, Episode ${ep.episode_number}: ${ep.name}`, url: `https://www.themoviedb.org/tv/${showId}/season/${sn}` });
       }
     }
     if (show.seasons?.length) show.seasons = [...new Map(canonicalRequests.map((s, i) => [typeof s === 'number' ? s : s.seasonNumber ?? s.number ?? i, s])).values()];
