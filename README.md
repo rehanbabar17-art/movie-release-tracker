@@ -14,7 +14,7 @@ A private, B2-backed watchlist that checks movie **cinema and digital** release 
 
 1. Create a TMDB API access token in your TMDB account. For Backblaze B2 use the existing private bucket `YOUR_PRIVATE_B2_BUCKET` and endpoint `YOUR_B2_ENDPOINT` if those are still the bucket details for your other trackers.
 2. In this repository's **Settings → Secrets and variables → Actions**, add `B2_KEY_ID`, `B2_APPLICATION_KEY`, `B2_BUCKET` (value `YOUR_PRIVATE_B2_BUCKET`), `B2_ENDPOINT` (the endpoint above), and `TMDB_API_KEY` (TMDB v4 read access token). These must be added separately to this repository; GitHub does not share repository secrets between repos.
-3. Create `movie-release-tracker/config.json` in the private B2 bucket. Start with `config.example.json`, then replace examples with real TMDB numeric IDs, your region's two-letter ISO country code, and your private ntfy topic. A movie's `releases` can be `cinema`, `digital`, or both. For series, set `seasons` to the season numbers you want (omit or use an empty list to include all seasons currently listed by TMDB).
+3. Create `movie-release-tracker/config.json` in the private B2 bucket. Start with `config.example.json`, then replace examples with real TMDB numeric IDs, your region's two-letter ISO country code, and your private ntfy topic. A movie's `releases` can be `cinema`, `digital`, or both. For series, you may list seasons as objects such as `{ "seasonNumber": 2, "seasonName": "Season 2" }`. The daily checker matches the number/name to TMDB, corrects minor spelling mistakes, and writes the canonical season name and number back to this B2 config. It also adds the season's TMDB premiere `air_date` to B2 release state and tracks episode air dates. Omit `seasons` or use an empty list to include all seasons currently listed by TMDB.
 4. Run **Actions → Check Releases → Run workflow** once to verify the setup. The daily schedule then keeps it refreshed.
 
 To find a TMDB ID, search the title on themoviedb.org and copy the number in its URL. IDs avoid title ambiguity; when you give me your titles, they can be matched and entered in B2 after you decide which seasons and your region.
@@ -33,6 +33,6 @@ Open `http://127.0.0.1:3000`. The dashboard filters the saved B2 release list fo
 ## Dates and limitations
 
 - Movie sources are TMDB movie release-date records for the configured country. The checker maps theatrical / limited-theatrical release types to **Cinema**, and digital / streaming release types to **Digital**. TMDB coverage varies by title and country; no date is invented when the source has none.
-- TV episodes use TMDB's season episode `air_date`. This is the listed date, not a promise about a particular streaming platform's local availability time.
+- TV seasons and episodes use TMDB's season/episode `air_date`. Season premiere dates and individual episode dates are listed separately; these are listed dates, not a promise about a particular streaming platform's local availability time.
 - The release window uses UTC calendar days. Notification de-duplication records a release ID and date; if a date changes, the new date can generate a new alert.
 - Watchlist contents are not checked into this repository. Keep the ntfy topic private because anyone who knows a public ntfy topic can subscribe to it.

@@ -2,9 +2,10 @@ import 'dotenv/config';
 import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 
 type Movie = { title: string; tmdbId: number; releases?: Array<'cinema' | 'digital'> };
-type Show = { title: string; tmdbId: number; seasons?: number[] };
+type SeasonRequest = number | { seasonNumber?: number; seasonName?: string; number?: number; name?: string };
+type Show = { title: string; tmdbId: number; seasons?: SeasonRequest[] };
 type Config = { region: string; ntfy: { server: string; topic: string }; movies: Movie[]; shows: Show[] };
-type Release = { id: string; title: string; kind: 'cinema' | 'digital' | 'episode'; date: string; detail: string; url: string };
+type Release = { id: string; title: string; kind: 'cinema' | 'digital' | 'episode' | 'season'; date: string; detail: string; url: string };
 type State = { checkedAt?: string; releases: Release[]; notified: string[] };
 const PREFIX = 'movie-release-tracker/';
 const BUCKET = process.env.B2_BUCKET;
@@ -16,6 +17,29 @@ async function readJson<T>(key: string, fallback?: T): Promise<T> {
 async function writeJson(key: string, value: unknown) { await s3.send(new PutObjectCommand({ Bucket: BUCKET, Key: PREFIX + key, Body: JSON.stringify(value, null, 2), ContentType: 'application/json' })); }
 export async function loadDashboard() { const state = await readJson<State>('state.json', { releases: [], notified: [] }); return { checkedAt: state.checkedAt || null, releases: state.releases || [] }; }
 function dateOnly(s?: string) { return s?.slice(0, 10) || ''; }
+type TmdbSeason = { season_number: number; name: string; air_date?: string | null };
+function normalizeSeasonName(name = '') { return name.toLocaleLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, ' ').trim(); }
+function editDistance(a: string, b: string): number {
+  const row = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    let prev = row[0]; row[0] = i;
+    for (let j = 1; j <= b.length; j++) { const old = row[j]; row[j] = Math.min(row[j] + 1, row[j - 1] + 1, prev + (a[i - 1] === b[j - 1] ? 0 : 1)); prev = old; }
+  }
+  return row[b.length];
+}
+export function resolveSeason(request: SeasonRequest, available: TmdbSeason[]): TmdbSeason | undefined {
+  const requestedNumber = typeof request === 'number' ? request : request.seasonNumber ?? request.number;
+  const requestedName = normalizeSeasonName(typeof request === 'number' ? '' : request.seasonName ?? request.name ?? '');
+  const numberMatch = available.find(s => s.season_number === requestedNumber);
+  if (!requestedName) return numberMatch;
+  const exactName = available.find(s => normalizeSeasonName(s.name) === requestedName);
+  if (exactName) return exactName;
+  if (numberMatch) return numberMatch;
+  const ranked = available.map(s => ({ season: s, distance: editDistance(requestedName, normalizeSeasonName(s.name)) }))
+    .sort((a, b) => a.distance - b.distance || a.season.season_number - b.season.season_number);
+  const best = ranked[0];
+  return best && best.distance <= Math.max(2, Math.floor(requestedName.length * 0.25)) ? best.season : undefined;
+}
 type ReminderStage = 30 | 7 | 3;
 export function getReminderStage(releaseDate: string, today = new Date().toISOString().slice(0, 10)): ReminderStage | null {
   const daysUntil = Math.round((Date.parse(`${releaseDate}T00:00:00Z`) - Date.parse(`${today}T00:00:00Z`)) / 86_400_000);
@@ -51,16 +75,33 @@ export async function checkReleases() {
     }
   }
   for (const show of config.shows || []) {
-    const info = await tmdb<{ name?: string; seasons?: Array<{ season_number: number }> }>(`/tv/${show.tmdbId}`);
-    const seasons = (show.seasons?.length ? show.seasons : (info.seasons || []).map(s => s.season_number).filter(n => n > 0));
-    for (const sn of seasons) {
-      const season = await tmdb<{ episodes?: Array<{ id: number; name: string; episode_number: number; air_date?: string }> }>(`/tv/${show.tmdbId}/season/${sn}`);
+    const info = await tmdb<{ name?: string; seasons?: TmdbSeason[] }>(`/tv/${show.tmdbId}`);
+    const available = (info.seasons || []).filter(s => s.season_number > 0);
+    const requests: SeasonRequest[] = show.seasons?.length ? show.seasons : available.map(s => s.season_number);
+    const canonicalRequests: SeasonRequest[] = [];
+    for (const request of requests) {
+      const seasonMeta = resolveSeason(request, available);
+      if (!seasonMeta) {
+        const entered = typeof request === 'number' ? `season ${request}` : (request.seasonName ?? request.name ?? `season ${request.seasonNumber ?? request.number ?? '?'}`);
+        console.warn(`Could not match ${show.title} entry "${entered}" to a TMDB season; leaving it unchanged in B2.`);
+        canonicalRequests.push(request);
+        continue;
+      }
+      const sn = seasonMeta.season_number;
+      canonicalRequests.push({ seasonNumber: sn, seasonName: seasonMeta.name });
+      const season = await tmdb<{ name?: string; air_date?: string | null; episodes?: Array<{ id: number; name: string; episode_number: number; air_date?: string }> }>(`/tv/${show.tmdbId}/season/${sn}`);
+      const seasonName = season.name || seasonMeta.name || `Season ${sn}`;
+      const seasonReleaseDate = dateOnly(season.air_date || seasonMeta.air_date || undefined);
+      if (seasonReleaseDate) found.push({ id: `season-${show.tmdbId}-${sn}-${seasonReleaseDate}`, title: show.title, kind: 'season', date: seasonReleaseDate, detail: `Season ${sn}: ${seasonName} premiere`, url: `https://www.themoviedb.org/tv/${show.tmdbId}/season/${sn}` });
       for (const ep of season.episodes || []) {
         const date = dateOnly(ep.air_date); if (!date) continue;
-        found.push({ id: `episode-${ep.id}-${date}`, title: show.title, kind: 'episode', date, detail: `Season ${sn}, Episode ${ep.episode_number}: ${ep.name}`, url: `https://www.themoviedb.org/tv/${show.tmdbId}/season/${sn}` });
+        found.push({ id: `episode-${ep.id}-${date}`, title: show.title, kind: 'episode', date, detail: `${seasonName}, Episode ${ep.episode_number}: ${ep.name}`, url: `https://www.themoviedb.org/tv/${show.tmdbId}/season/${sn}` });
       }
     }
+    if (show.seasons?.length) show.seasons = [...new Map(canonicalRequests.map((s, i) => [typeof s === 'number' ? s : s.seasonNumber ?? s.number ?? i, s])).values()];
   }
+  // Write back TMDB-canonical season names and numbers alongside other B2 config.
+  await writeJson('config.json', config);
   const today = new Date().toISOString().slice(0, 10);
   const dashboardLimit = new Date(); dashboardLimit.setUTCDate(dashboardLimit.getUTCDate() + 30); const dashboardMax = dashboardLimit.toISOString().slice(0, 10);
   const upcoming = [...new Map(found.filter(r => r.date >= today && r.date <= dashboardMax).map(r => [r.id, r])).values()].sort((a,b) => a.date.localeCompare(b.date) || a.title.localeCompare(b.title));

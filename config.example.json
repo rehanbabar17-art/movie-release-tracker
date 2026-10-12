@@ -4,7 +4,13 @@
     { "title": "Example movie", "tmdbId": 123456, "releases": ["cinema", "digital"] }
   ],
   "shows": [
-    { "title": "Example series", "tmdbId": 654321, "seasons": [2] }
+    {
+      "title": "Example series",
+      "tmdbId": 654321,
+      "seasons": [
+        { "seasonNumber": 2, "seasonName": "Season 2" }
+      ]
+    }
   ],
   "ntfy": {
     "server": "https://ntfy.sh",
