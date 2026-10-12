@@ -1,0 +1,13 @@
+{
+  "region": "US",
+  "movies": [
+    { "title": "Example movie", "tmdbId": 123456, "releases": ["cinema", "digital"] }
+  ],
+  "shows": [
+    { "title": "Example series", "tmdbId": 654321, "seasons": [2] }
+  ],
+  "ntfy": {
+    "server": "https://ntfy.sh",
+    "topic": "YOUR_PRIVATE_NTFY_TOPIC"
+  }
+}

@@ -1,0 +1,11 @@
+import 'dotenv/config';
+import express from 'express';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { checkReleases, loadDashboard } from './release-tracker.js';
+const app = express(); const here = path.dirname(fileURLToPath(import.meta.url));
+app.get('/api/health', (_req, res) => res.json({ ok: true }));
+app.get('/api/releases', async (_req, res) => { try { res.json(await loadDashboard()); } catch { res.status(500).json({ error: 'Could not load release data from B2. Check B2 credentials and initialize the config object.' }); } });
+app.post('/api/check', async (_req, res) => { try { res.json(await checkReleases()); } catch (e) { res.status(500).json({ error: e instanceof Error ? e.message : 'Release check failed' }); } });
+app.use(express.static(path.resolve(here, '../public')));
+app.listen(Number(process.env.PORT) || 3000, process.env.HOST || '127.0.0.1', () => console.log('Release Radar at http://127.0.0.1:3000'));

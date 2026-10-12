@@ -1,0 +1,22 @@
+{
+  "name": "movie-release-tracker",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "tsx src/server.ts",
+    "check": "tsx -e \"import { checkReleases } from './src/release-tracker.ts'; checkReleases().catch(e => { console.error(e); process.exit(1); });\"",
+    "typecheck": "tsc --noEmit"
+  },
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1149.0",
+    "dotenv": "^18.0.7",
+    "express": "^5.3.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.6.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
