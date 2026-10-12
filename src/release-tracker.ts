@@ -60,7 +60,7 @@ export async function checkReleases() {
   const fresh = upcoming.filter(r => !already.has(r.id));
   if (process.env.SEND_NOTIFICATIONS !== 'false' && config.ntfy?.topic) {
     for (const r of fresh) {
-      const response = await fetch(`${(config.ntfy.server || 'https://ntfy.sh').replace(/\/$/, '')}/${encodeURIComponent(config.ntfy.topic)}`, { method: 'POST', headers: { Title: `${r.title} — ${r.kind === 'episode' ? 'New episode' : r.kind === 'cinema' ? 'Cinema release' : 'Digital release'}`, Tags: 'movie_camera,calendar', Click: r.url, Priority: 'default' }, body: `${r.detail}\nRelease date: ${r.date}` });
+      const response = await fetch(`${(config.ntfy.server || 'https://ntfy.sh').replace(/\/$/, '')}/${encodeURIComponent(config.ntfy.topic)}`, { method: 'POST', headers: { Title: `${r.title} - ${r.kind === 'episode' ? 'New episode' : r.kind === 'cinema' ? 'Cinema release' : 'Digital release'}`, Tags: 'movie_camera,calendar', Click: r.url, Priority: 'default' }, body: `${r.detail}\nRelease date: ${r.date}` });
       if (!response.ok) throw new Error(`ntfy notification failed (${response.status})`);
       already.add(r.id);
     }
