@@ -54,10 +54,11 @@ export async function checkReleases() {
     }
   }
   const today = new Date().toISOString().slice(0, 10);
-  const limit = new Date(); limit.setUTCDate(limit.getUTCDate() + 7); const max = limit.toISOString().slice(0, 10);
-  const upcoming = [...new Map(found.filter(r => r.date >= today && r.date <= max).map(r => [r.id, r])).values()].sort((a,b) => a.date.localeCompare(b.date) || a.title.localeCompare(b.title));
+  const dashboardLimit = new Date(); dashboardLimit.setUTCDate(dashboardLimit.getUTCDate() + 30); const dashboardMax = dashboardLimit.toISOString().slice(0, 10);
+  const notificationLimit = new Date(); notificationLimit.setUTCDate(notificationLimit.getUTCDate() + 7); const notificationMax = notificationLimit.toISOString().slice(0, 10);
+  const upcoming = [...new Map(found.filter(r => r.date >= today && r.date <= dashboardMax).map(r => [r.id, r])).values()].sort((a,b) => a.date.localeCompare(b.date) || a.title.localeCompare(b.title));
   const already = new Set(state.notified || []);
-  const fresh = upcoming.filter(r => !already.has(r.id));
+  const fresh = upcoming.filter(r => r.date <= notificationMax && !already.has(r.id));
   if (process.env.SEND_NOTIFICATIONS !== 'false' && config.ntfy?.topic) {
     for (const r of fresh) {
       const response = await fetch(`${(config.ntfy.server || 'https://ntfy.sh').replace(/\/$/, '')}/${encodeURIComponent(config.ntfy.topic)}`, { method: 'POST', headers: { Title: `${r.title} - ${r.kind === 'episode' ? 'New episode' : r.kind === 'cinema' ? 'Cinema release' : 'Digital release'}`, Tags: 'movie_camera,calendar', Click: r.url, Priority: 'default' }, body: `${r.detail}\nRelease date: ${r.date}` });

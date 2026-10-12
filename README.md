@@ -1,13 +1,13 @@
 # Movie & Episode Release Radar
 
-A private, B2-backed watchlist that checks movie **cinema and digital** release dates plus TV season episode air dates every day. It sends new-date alerts to a private [ntfy](https://ntfy.sh) topic and provides a dashboard with **Today**, **Next 3 days**, and **Next 7 days** views.
+A private, B2-backed watchlist that checks movie **cinema and digital** release dates plus TV season episode air dates every day. It sends new-date alerts to a private [ntfy](https://ntfy.sh) topic and provides a dashboard with **Today**, **Next 3 days**, **Next 7 days**, and **Next 30 days** views.
 
 ## How it works
 
 - GitHub Actions runs daily at 12:00 UTC (GitHub may delay scheduled jobs during busy periods); runs can also be started manually.
 - Watchlist and notification settings live only in the private Backblaze B2 bucket at `movie-release-tracker/config.json`.
 - The last check, upcoming releases, and notification de-duplication state live at `movie-release-tracker/state.json`.
-- The workflow fetches catalog data from TMDB, writes the fresh state back to B2, and sends ntfy alerts for newly found dates in the next seven days. Dates only notify once per release identifier/date.
+- The workflow fetches catalog data from TMDB, writes releases in the next 30 days back to B2, and sends ntfy alerts for newly found dates in the next seven days. Dates only notify once per release identifier/date.
 - The dashboard runs locally and reads release data from B2; it has no login, so keep it bound to localhost and do not expose it publicly.
 
 ## Setup
@@ -28,7 +28,7 @@ cp .env.example .env
 npm run dev
 ```
 
-Open `http://127.0.0.1:3000`. The dashboard filters the saved B2 release list for Today, Next 3 days, and Next 7 days. `npm run check` runs a check manually. Do not commit `.env`, private B2 config, or state.
+Open `http://127.0.0.1:3000`. The dashboard filters the saved B2 release list for Today, Next 3 days, Next 7 days, and Next 30 days. `npm run check` runs a check manually. Do not commit `.env`, private B2 config, or state.
 
 ## Dates and limitations
 
