@@ -51,8 +51,7 @@ export function chooseTitleMatch<T extends SearchCandidate>(query: string, resul
     const names = [item.title, item.original_title, item.name, item.original_name].filter(Boolean).map(value => normalizedTitle(value!));
     return { item, distance: Math.min(...names.map(name => editDistance(q, name))) };
   }).sort((a, b) => a.distance - b.distance || (b.item.popularity || 0) - (a.item.popularity || 0));
-  const best = ranked[0];
-  return best && best.distance <= Math.max(2, Math.floor(q.length * 0.22)) ? best.item : undefined;
+  return ranked[0]?.item;
 }
 async function ensureCatalogId(kind: 'movie' | 'tv', item: Movie | Show): Promise<number | undefined> {
   const enteredTitle = (item.title || item.name || '').trim();
@@ -72,14 +71,14 @@ async function ensureCatalogId(kind: 'movie' | 'tv', item: Movie | Show): Promis
     : await tmdb<{ results: SearchCandidate[] }>(`/search/tv?query=${encodeURIComponent(enteredTitle)}`);
   const candidate = chooseTitleMatch(enteredTitle, result.results || []);
   if (!candidate) {
-    console.warn(`Could not match ${kind} "${enteredTitle}" to TMDB; leaving it in B2 and skipping it this run.`);
+    console.warn(`TMDB returned no search results for ${kind} "${enteredTitle}"; leaving it in B2 and skipping it this run.`);
     return undefined;
   }
   item.tmdbId = candidate.id;
   item.title = (kind === 'movie' ? candidate.title || candidate.original_title : candidate.name || candidate.original_name) || enteredTitle;
   delete item.name;
   delete item.tmdb_id;
-  console.log(`Resolved ${kind} "${enteredTitle}" as "${item.title}" (TMDB ID ${candidate.id}); saving the match to B2.`);
+  console.log(`Linked ${kind} "${enteredTitle}" to closest TMDB result "${item.title}" (TMDB ID ${candidate.id}); saving the match to B2.`);
   return candidate.id;
 }
 type ReminderStage = 30 | 7 | 3;
