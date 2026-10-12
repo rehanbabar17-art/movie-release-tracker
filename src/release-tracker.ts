@@ -18,7 +18,12 @@ export async function loadDashboard() { const state = await readJson<State>('sta
 function dateOnly(s?: string) { return s?.slice(0, 10) || ''; }
 async function tmdb<T>(path: string): Promise<T> {
   const key = process.env.TMDB_API_KEY; if (!key) throw new Error('TMDB_API_KEY is not configured');
-  const r = await fetch(`https://api.themoviedb.org/3${path}`, { headers: { Authorization: `Bearer ${key}`, accept: 'application/json' } });
+  const url = new URL(`https://api.themoviedb.org/3${path}`);
+  const isV3ApiKey = /^[a-f0-9]{32}$/i.test(key);
+  if (isV3ApiKey) url.searchParams.set('api_key', key);
+  const headers: Record<string, string> = { accept: 'application/json' };
+  if (!isV3ApiKey) headers.Authorization = `Bearer ${key}`;
+  const r = await fetch(url, { headers });
   if (!r.ok) throw new Error(`TMDB returned ${r.status} for ${path}`); return r.json() as Promise<T>;
 }
 export async function checkReleases() {
