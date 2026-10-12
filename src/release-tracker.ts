@@ -16,6 +16,14 @@ async function readJson<T>(key: string, fallback?: T): Promise<T> {
 async function writeJson(key: string, value: unknown) { await s3.send(new PutObjectCommand({ Bucket: BUCKET, Key: PREFIX + key, Body: JSON.stringify(value, null, 2), ContentType: 'application/json' })); }
 export async function loadDashboard() { const state = await readJson<State>('state.json', { releases: [], notified: [] }); return { checkedAt: state.checkedAt || null, releases: state.releases || [] }; }
 function dateOnly(s?: string) { return s?.slice(0, 10) || ''; }
+type ReminderStage = 30 | 7 | 3;
+export function getReminderStage(releaseDate: string, today = new Date().toISOString().slice(0, 10)): ReminderStage | null {
+  const daysUntil = Math.round((Date.parse(`${releaseDate}T00:00:00Z`) - Date.parse(`${today}T00:00:00Z`)) / 86_400_000);
+  if (!Number.isFinite(daysUntil) || daysUntil < 0 || daysUntil > 30) return null;
+  if (daysUntil <= 3) return 3;
+  if (daysUntil <= 7) return 7;
+  return 30;
+}
 async function tmdb<T>(path: string): Promise<T> {
   const key = process.env.TMDB_API_KEY; if (!key) throw new Error('TMDB_API_KEY is not configured');
   const url = new URL(`https://api.themoviedb.org/3${path}`);
@@ -55,19 +63,24 @@ export async function checkReleases() {
   }
   const today = new Date().toISOString().slice(0, 10);
   const dashboardLimit = new Date(); dashboardLimit.setUTCDate(dashboardLimit.getUTCDate() + 30); const dashboardMax = dashboardLimit.toISOString().slice(0, 10);
-  const notificationLimit = new Date(); notificationLimit.setUTCDate(notificationLimit.getUTCDate() + 7); const notificationMax = notificationLimit.toISOString().slice(0, 10);
   const upcoming = [...new Map(found.filter(r => r.date >= today && r.date <= dashboardMax).map(r => [r.id, r])).values()].sort((a,b) => a.date.localeCompare(b.date) || a.title.localeCompare(b.title));
   const already = new Set(state.notified || []);
-  const fresh = upcoming.filter(r => r.date <= notificationMax && !already.has(r.id));
+  const due = upcoming.map(r => ({ release: r, stage: getReminderStage(r.date, today) }))
+    .filter((item): item is { release: Release; stage: ReminderStage } => item.stage !== null)
+    .filter(({ release, stage }) => !already.has(`${release.id}:d${stage}`) && !(stage === 7 && already.has(release.id)));
+  // Migrate old one-shot IDs so the previous 7-day alert is not repeated as a 7-day stage.
+  for (const release of upcoming) if (already.has(release.id)) already.add(`${release.id}:d7`);
+  let alertsSent = 0;
   if (process.env.SEND_NOTIFICATIONS !== 'false' && config.ntfy?.topic) {
-    for (const r of fresh) {
-      const response = await fetch(`${(config.ntfy.server || 'https://ntfy.sh').replace(/\/$/, '')}/${encodeURIComponent(config.ntfy.topic)}`, { method: 'POST', headers: { Title: `${r.title} - ${r.kind === 'episode' ? 'New episode' : r.kind === 'cinema' ? 'Cinema release' : 'Digital release'}`, Tags: 'movie_camera,calendar', Click: r.url, Priority: 'default' }, body: `${r.detail}\nRelease date: ${r.date}` });
+    for (const { release: r, stage } of due) {
+      const response = await fetch(`${(config.ntfy.server || 'https://ntfy.sh').replace(/\/$/, '')}/${encodeURIComponent(config.ntfy.topic)}`, { method: 'POST', headers: { Title: `${r.title} - ${stage}-day reminder`, Tags: 'movie_camera,calendar', Click: r.url, Priority: 'default' }, body: `${r.detail}\nRelease date: ${r.date}\nReminder stage: ${stage} days` });
       if (!response.ok) throw new Error(`ntfy notification failed (${response.status})`);
-      already.add(r.id);
+      already.add(`${r.id}:d${stage}`);
+      alertsSent++;
     }
   }
   const next: State = { checkedAt: new Date().toISOString(), releases: upcoming, notified: [...already].slice(-5000) };
   await writeJson('state.json', next);
-  console.log(`Checked ${config.movies?.length || 0} movies and ${config.shows?.length || 0} shows; ${upcoming.length} upcoming releases, ${fresh.length} new alerts.`);
+  console.log(`Checked ${config.movies?.length || 0} movies and ${config.shows?.length || 0} shows; ${upcoming.length} upcoming releases, ${alertsSent} reminder-stage alerts sent.`);
   return next;
 }

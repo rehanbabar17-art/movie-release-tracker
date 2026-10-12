@@ -7,7 +7,7 @@ A private, B2-backed watchlist that checks movie **cinema and digital** release 
 - GitHub Actions runs daily at 12:00 UTC (GitHub may delay scheduled jobs during busy periods); runs can also be started manually.
 - Watchlist and notification settings live only in the private Backblaze B2 bucket at `movie-release-tracker/config.json`.
 - The last check, upcoming releases, and notification de-duplication state live at `movie-release-tracker/state.json`.
-- The workflow fetches catalog data from TMDB, writes releases in the next 30 days back to B2, and sends ntfy alerts for newly found dates in the next seven days. Dates only notify once per release identifier/date.
+- The workflow fetches catalog data from TMDB, writes releases in the next 30 days back to B2, and sends ntfy reminders at three stages: within 30 days, within 7 days, and within 3 days. Each release gets at most one alert per stage; daily checks do not repeat an alert until it reaches the next stage. Older one-shot alert history is treated as the 7-day stage to avoid duplicates.
 - The dashboard runs locally and reads release data from B2; it has no login, so keep it bound to localhost and do not expose it publicly.
 
 ## Setup
