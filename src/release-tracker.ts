@@ -106,9 +106,12 @@ export async function checkReleases() {
   const region = (config.region || process.env.RELEASE_REGION || 'US').toUpperCase();
   const found: Release[] = [];
   for (const m of config.movies || []) {
+    // User preference: every tracked movie watches both theatrical and digital dates.
+    m.releases = ['cinema', 'digital'];
     const movieId = await ensureCatalogId('movie', m);
     if (!movieId) continue;
     const movieTitle = m.title || m.name || `Movie ${movieId}`;
+    console.log(`Tracking cinema and digital release dates for "${movieTitle}".`);
     const data = await tmdb<{ results: Array<{ iso_3166_1: string; release_dates: Array<{ release_date: string; type: number; note?: string }> }> }>(`/movie/${movieId}/release_dates`);
     const country = data.results.find(x => x.iso_3166_1 === region);
     for (const r of country?.release_dates || []) {
