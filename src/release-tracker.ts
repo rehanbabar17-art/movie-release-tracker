@@ -9,7 +9,7 @@ type Release = { id: string; title: string; kind: 'cinema' | 'digital' | 'episod
 type State = { checkedAt?: string; releases: Release[]; notified: string[] };
 const PREFIX = 'movie-release-tracker/';
 const BUCKET = process.env.B2_BUCKET;
-const s3 = new S3Client({ region: 'us-east-1', endpoint: (process.env.B2_ENDPOINT || 'YOUR_B2_ENDPOINT').replace(/\/$/, ''), forcePathStyle: true, credentials: { accessKeyId: process.env.B2_KEY_ID || '', secretAccessKey: process.env.B2_APPLICATION_KEY || '' } });
+const s3 = new S3Client({ region: 'us-east-1', endpoint: process.env.B2_ENDPOINT?.replace(/\/$/, ''), forcePathStyle: true, credentials: { accessKeyId: process.env.B2_KEY_ID || '', secretAccessKey: process.env.B2_APPLICATION_KEY || '' } });
 async function readJson<T>(key: string, fallback?: T): Promise<T> {
   try { const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: PREFIX + key })); return JSON.parse(await r.Body!.transformToString()) as T; }
   catch (e: any) { if (e?.$metadata?.httpStatusCode === 404 && fallback !== undefined) return fallback; throw e; }
@@ -100,7 +100,7 @@ async function tmdb<T>(path: string): Promise<T> {
   if (!r.ok) throw new Error(`TMDB returned ${r.status} for ${path}`); return r.json() as Promise<T>;
 }
 export async function checkReleases() {
-  if (!BUCKET || !process.env.B2_KEY_ID || !process.env.B2_APPLICATION_KEY) throw new Error('Configure B2_BUCKET, B2_KEY_ID and B2_APPLICATION_KEY');
+  if (!BUCKET || !process.env.B2_ENDPOINT || !process.env.B2_KEY_ID || !process.env.B2_APPLICATION_KEY) throw new Error('Configure B2_BUCKET, B2_ENDPOINT, B2_KEY_ID and B2_APPLICATION_KEY');
   const config = await readJson<Config>('config.json');
   const state = await readJson<State>('state.json', { releases: [], notified: [] });
   const region = (config.region || process.env.RELEASE_REGION || 'US').toUpperCase();
