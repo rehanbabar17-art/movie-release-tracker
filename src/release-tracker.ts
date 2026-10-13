@@ -63,7 +63,7 @@ async function ensureCatalogId(kind: 'movie' | 'tv', item: Movie | Show): Promis
     return existing as number;
   }
   if (!enteredTitle) {
-    console.warn(`Skipping a ${kind} entry with no title or TMDB ID; add at least a title in B2.`);
+    console.warn(`Skipping a ${kind} entry without a title or TMDB ID.`);
     return undefined;
   }
   const result = kind === 'movie'
@@ -71,14 +71,14 @@ async function ensureCatalogId(kind: 'movie' | 'tv', item: Movie | Show): Promis
     : await tmdb<{ results: SearchCandidate[] }>(`/search/tv?query=${encodeURIComponent(enteredTitle)}`);
   const candidate = chooseTitleMatch(enteredTitle, result.results || []);
   if (!candidate) {
-    console.warn(`TMDB returned no search results for ${kind} "${enteredTitle}"; leaving it in B2 and skipping it this run.`);
+    console.warn(`TMDB returned no search results for one ${kind} entry; skipping it this run.`);
     return undefined;
   }
   item.tmdbId = candidate.id;
   item.title = (kind === 'movie' ? candidate.title || candidate.original_title : candidate.name || candidate.original_name) || enteredTitle;
   delete item.name;
   delete item.tmdb_id;
-  console.log(`Linked ${kind} "${enteredTitle}" to closest TMDB result "${item.title}" (TMDB ID ${candidate.id}); saving the match to B2.`);
+  console.log(`Linked one ${kind} entry to a TMDB catalog record; saving the match to B2.`);
   return candidate.id;
 }
 type ReminderStage = 30 | 7 | 3;
@@ -111,7 +111,7 @@ export async function checkReleases() {
     const movieId = await ensureCatalogId('movie', m);
     if (!movieId) continue;
     const movieTitle = m.title || m.name || `Movie ${movieId}`;
-    console.log(`Tracking cinema and digital release dates for "${movieTitle}".`);
+    console.log('Tracking cinema and digital release dates for one movie.');
     const data = await tmdb<{ results: Array<{ iso_3166_1: string; release_dates: Array<{ release_date: string; type: number; note?: string }> }> }>(`/movie/${movieId}/release_dates`);
     const country = data.results.find(x => x.iso_3166_1 === region);
     for (const r of country?.release_dates || []) {
@@ -135,7 +135,7 @@ export async function checkReleases() {
       const seasonMeta = resolveSeason(request, available);
       if (!seasonMeta) {
         const entered = typeof request === 'number' ? `season ${request}` : (request.seasonName ?? request.name ?? `season ${request.seasonNumber ?? request.number ?? '?'}`);
-        console.warn(`Could not match ${showTitle} entry "${entered}" to a TMDB season; leaving it unchanged in B2.`);
+        console.warn('Could not match one requested season to TMDB; leaving that season entry unchanged in B2.');
         canonicalRequests.push(request);
         continue;
       }
