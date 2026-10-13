@@ -156,10 +156,14 @@ export async function checkReleases() {
     for (const seasonMeta of available) {
       if (checkedSeasonNumbers.has(seasonMeta.season_number)) continue;
       const sn = seasonMeta.season_number;
-      const season = await tmdb<{ name?: string; air_date?: string | null }>(`/tv/${showId}/season/${sn}`);
+      const season = await tmdb<{ name?: string; air_date?: string | null; episodes?: Array<{ id: number; name: string; episode_number: number; air_date?: string }> }>(`/tv/${showId}/season/${sn}`);
       const seasonName = season.name || seasonMeta.name || `Season ${sn}`;
       const seasonReleaseDate = dateOnly(season.air_date || seasonMeta.air_date || undefined);
       if (seasonReleaseDate) found.push({ id: `season-${showId}-${sn}-${seasonReleaseDate}`, title: showTitle, kind: 'season', date: seasonReleaseDate, detail: `Season ${sn}: ${seasonName} premiere`, url: `https://www.themoviedb.org/tv/${showId}/season/${sn}` });
+      for (const ep of season.episodes || []) {
+        const date = dateOnly(ep.air_date); if (!date) continue;
+        found.push({ id: `episode-${ep.id}-${date}`, title: showTitle, kind: 'episode', date, detail: `${seasonName}, Episode ${ep.episode_number}: ${ep.name}`, url: `https://www.themoviedb.org/tv/${showId}/season/${sn}` });
+      }
     }
     if (show.seasons?.length) show.seasons = [...new Map(canonicalRequests.map((s, i) => [typeof s === 'number' ? s : s.seasonNumber ?? s.number ?? i, s])).values()];
   }
