@@ -11,6 +11,7 @@ on:
         default: true
 permissions:
   contents: read
+  actions: write
 concurrency:
   group: movie-release-check
   cancel-in-progress: false
@@ -20,6 +21,12 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+
+      - name: Keep scheduled workflow active
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh api --method PUT "/repos/${{ github.repository }}/actions/workflows/check-releases.yml/enable" || true
       - uses: actions/setup-node@v4
         with:
           node-version: 22
