@@ -1,27 +1,30 @@
 name: Check Releases
+
 on:
   schedule:
     - cron: '0 12 * * *'
   workflow_dispatch:
     inputs:
       send_notifications:
-        description: Send ntfy notifications for newly found releases
+        description: Send ntfy notifications for newly found or updated releases
         required: false
         type: boolean
         default: true
+
 permissions:
   contents: read
   actions: write
+
 concurrency:
   group: movie-release-check
   cancel-in-progress: false
+
 jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-
       - name: Keep scheduled workflow active
         if: github.event_name == 'schedule'
         env:
@@ -40,4 +43,6 @@ jobs:
           B2_BUCKET: ${{ secrets.B2_BUCKET }}
           B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
           TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+          NTFY_SERVER: ${{ vars.NTFY_SERVER || secrets.NTFY_SERVER }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           SEND_NOTIFICATIONS: ${{ github.event_name != 'workflow_dispatch' || inputs.send_notifications }}

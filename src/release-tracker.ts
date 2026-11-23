@@ -4,7 +4,7 @@ import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3
 type Movie = { title?: string; name?: string; tmdbId?: number | null; tmdb_id?: number | null; releases?: Array<'cinema' | 'digital'> };
 type SeasonRequest = number | { seasonNumber?: number; seasonName?: string; number?: number; name?: string };
 type Show = { title?: string; name?: string; tmdbId?: number | null; tmdb_id?: number | null; seasons?: SeasonRequest[]; seasonNumber?: number; seasonName?: string };
-type Config = { region: string; ntfy: { server: string; topic: string }; movies: Movie[]; shows: Show[] };
+type Config = { region: string; ntfy?: { server?: string; topic?: string }; movies: Movie[]; shows: Show[] };
 type Release = { id: string; title: string; kind: 'cinema' | 'digital' | 'episode' | 'season'; date: string; detail: string; url: string };
 type State = { checkedAt?: string; releases: Release[]; notified: string[] };
 
@@ -38,6 +38,10 @@ export async function loadDashboard() {
 
 function dateOnly(s?: string) {
   return s?.slice(0, 10) || '';
+}
+
+function releaseBaseKey(id: string): string {
+  return id.replace(/-\d{4}-\d{2}-\d{2}$/, '');
 }
 
 type TmdbSeason = { season_number: number; name: string; air_date?: string | null };
@@ -198,6 +202,39 @@ export async function checkReleases() {
     const canonicalRequests: SeasonRequest[] = [];
     const checkedSeasonNumbers = new Set<number>();
 
+    const collectSeason = async (sn: number, fallbackName?: string, fallbackAirDate?: string | null) => {
+      const season = await tmdb<{ name?: string; air_date?: string | null; episodes?: Array<{ id: number; name: string; episode_number: number; air_date?: string }> }>(`/tv/${showId}/season/${sn}`);
+      const seasonName = season.name || fallbackName || `Season ${sn}`;
+      const firstEpisodeDate = (season.episodes || [])
+        .map(ep => dateOnly(ep.air_date))
+        .filter(Boolean)
+        .sort()[0];
+      const seasonReleaseDate = dateOnly(season.air_date || fallbackAirDate || firstEpisodeDate || undefined);
+      if (seasonReleaseDate) {
+        found.push({
+          id: `season-${showId}-${sn}-${seasonReleaseDate}`,
+          title: showTitle,
+          kind: 'season',
+          date: seasonReleaseDate,
+          detail: `Season ${sn}: ${seasonName} premiere`,
+          url: `https://www.themoviedb.org/tv/${showId}/season/${sn}`
+        });
+      }
+      for (const ep of season.episodes || []) {
+        const date = dateOnly(ep.air_date);
+        if (!date) continue;
+        found.push({
+          id: `episode-${ep.id}-${date}`,
+          title: showTitle,
+          kind: 'episode',
+          date,
+          detail: `${seasonName}, Episode ${ep.episode_number}: ${ep.name}`,
+          url: `https://www.themoviedb.org/tv/${showId}/season/${sn}`
+        });
+      }
+      return seasonName;
+    };
+
     for (const request of requests) {
       const seasonMeta = resolveSeason(request, available);
       if (!seasonMeta) {
@@ -208,63 +245,14 @@ export async function checkReleases() {
       const sn = seasonMeta.season_number;
       checkedSeasonNumbers.add(sn);
       canonicalRequests.push({ seasonNumber: sn, seasonName: seasonMeta.name });
-      const season = await tmdb<{ name?: string; air_date?: string | null; episodes?: Array<{ id: number; name: string; episode_number: number; air_date?: string }> }>(`/tv/${showId}/season/${sn}`);
-      const seasonName = season.name || seasonMeta.name || `Season ${sn}`;
-      const seasonReleaseDate = dateOnly(season.air_date || seasonMeta.air_date || undefined);
-      if (seasonReleaseDate) {
-        found.push({
-          id: `season-${showId}-${sn}-${seasonReleaseDate}`,
-          title: showTitle,
-          kind: 'season',
-          date: seasonReleaseDate,
-          detail: `Season ${sn}: ${seasonName} premiere`,
-          url: `https://www.themoviedb.org/tv/${showId}/season/${sn}`
-        });
-      }
-      for (const ep of season.episodes || []) {
-        const date = dateOnly(ep.air_date);
-        if (!date) continue;
-        found.push({
-          id: `episode-${ep.id}-${date}`,
-          title: showTitle,
-          kind: 'episode',
-          date,
-          detail: `${seasonName}, Episode ${ep.episode_number}: ${ep.name}`,
-          url: `https://www.themoviedb.org/tv/${showId}/season/${sn}`
-        });
-      }
+      await collectSeason(sn, seasonMeta.name, seasonMeta.air_date);
     }
 
-    // A show-level watch also alerts for future premieres of seasons not selected
-    // for episode tracking (e.g. tracking season 1 should still alert for season 2).
+    // A show-level watch also alerts for future premieres and episodes of seasons not selected
+    // explicitly (e.g. tracking season 1 still alerts when season 2 or 3 dates are announced).
     for (const seasonMeta of available) {
       if (checkedSeasonNumbers.has(seasonMeta.season_number)) continue;
-      const sn = seasonMeta.season_number;
-      const season = await tmdb<{ name?: string; air_date?: string | null; episodes?: Array<{ id: number; name: string; episode_number: number; air_date?: string }> }>(`/tv/${showId}/season/${sn}`);
-      const seasonName = season.name || seasonMeta.name || `Season ${sn}`;
-      const seasonReleaseDate = dateOnly(season.air_date || seasonMeta.air_date || undefined);
-      if (seasonReleaseDate) {
-        found.push({
-          id: `season-${showId}-${sn}-${seasonReleaseDate}`,
-          title: showTitle,
-          kind: 'season',
-          date: seasonReleaseDate,
-          detail: `Season ${sn}: ${seasonName} premiere`,
-          url: `https://www.themoviedb.org/tv/${showId}/season/${sn}`
-        });
-      }
-      for (const ep of season.episodes || []) {
-        const date = dateOnly(ep.air_date);
-        if (!date) continue;
-        found.push({
-          id: `episode-${ep.id}-${date}`,
-          title: showTitle,
-          kind: 'episode',
-          date,
-          detail: `${seasonName}, Episode ${ep.episode_number}: ${ep.name}`,
-          url: `https://www.themoviedb.org/tv/${showId}/season/${sn}`
-        });
-      }
+      await collectSeason(seasonMeta.season_number, seasonMeta.name, seasonMeta.air_date);
     }
 
     if (show.seasons?.length) {
@@ -276,10 +264,15 @@ export async function checkReleases() {
   await writeJson('config.json', config);
 
   const today = new Date().toISOString().slice(0, 10);
-  // Keep all future releases (including > 30 days) so announced dates are tracked and alerted once,
-  // and then alerted again at 30, 7, 3, and 0 (Today) days.
+  // Keep all future releases (including > 30 days) so announced dates are tracked and shown in the app,
+  // alerted immediately when announced or updated, and reminded again at 30, 7, 3, and 0 (Today) days.
   const upcoming = [...new Map(found.filter(r => r.date >= today).map(r => [r.id, r])).values()]
     .sort((a, b) => a.date.localeCompare(b.date) || a.title.localeCompare(b.title));
+
+  const previousByBase = new Map<string, Release>();
+  for (const prev of state.releases || []) {
+    previousByBase.set(releaseBaseKey(prev.id), prev);
+  }
 
   const already = new Set(state.notified || []);
   // Migrate old one-shot IDs so the previous 7-day alert is not repeated as a 7-day stage.
@@ -293,41 +286,58 @@ export async function checkReleases() {
     .filter((item): item is { release: Release; stage: ReminderStage } => item.stage !== null)
     .filter(({ release, stage }) => !already.has(stageKey(release.id, stage)));
 
-  let alertsSent = 0;
-  if (process.env.SEND_NOTIFICATIONS !== 'false' && config.ntfy?.topic) {
-    for (const { release: r, stage } of due) {
-      const title =
-        stage === 'announced'
-          ? `${r.title} - Release Date Announced!`
-          : stage === 0
-          ? `${r.title} - Releasing Today!`
-          : `${r.title} - ${stage}-day reminder`;
-      const body =
-        stage === 'announced'
-          ? `${r.detail}\nAnnounced release date: ${r.date}\nYou will also receive reminders at 30, 7, and 3 days, plus on release day.`
-          : stage === 0
-          ? `${r.detail}\nRelease date: ${r.date} (Today!)`
-          : `${r.detail}\nRelease date: ${r.date}\nReminder stage: ${stage} days`;
-      const tags =
-        stage === 0
-          ? 'popcorn,tada,clapper'
-          : stage === 'announced'
-          ? 'loudspeaker,calendar'
-          : 'movie_camera,calendar';
+  const ntfyTopic = (config.ntfy?.topic || process.env.NTFY_TOPIC || '').trim();
+  const ntfyServer = (config.ntfy?.server || process.env.NTFY_SERVER || 'https://ntfy.sh').replace(/\/$/, '');
 
-      const response = await fetch(`${(config.ntfy.server || 'https://ntfy.sh').replace(/\/$/, '')}/${encodeURIComponent(config.ntfy.topic)}`, {
-        method: 'POST',
-        headers: {
-          Title: title,
-          Tags: tags,
-          Click: r.url,
-          Priority: stage === 0 ? 'high' : 'default'
-        },
-        body
-      });
-      if (!response.ok) throw new Error(`ntfy notification failed (${response.status})`);
-      already.add(stageKey(r.id, stage));
-      alertsSent++;
+  let alertsSent = 0;
+  if (process.env.SEND_NOTIFICATIONS !== 'false') {
+    if (!ntfyTopic) {
+      console.warn('ntfy notifications skipped: configure ntfy.topic in B2 config.json or NTFY_TOPIC env var.');
+    } else {
+      for (const { release: r, stage } of due) {
+        const prev = previousByBase.get(releaseBaseKey(r.id));
+        const isDateUpdated = Boolean(prev && prev.date !== r.date);
+        const daysUntil = Math.round((Date.parse(`${r.date}T00:00:00Z`) - Date.parse(`${today}T00:00:00Z`)) / 86_400_000);
+
+        const title =
+          isDateUpdated
+            ? `${r.title} - Release Date Updated!`
+            : stage === 'announced'
+            ? `${r.title} - Release Date Announced!`
+            : stage === 0
+            ? `${r.title} - Releasing Today!`
+            : `${r.title} - ${stage}-day reminder`;
+
+        const body =
+          isDateUpdated
+            ? `${r.detail}\nPrevious date: ${prev!.date}\nNew release date: ${r.date} (in ${daysUntil} days)`
+            : stage === 'announced'
+            ? `${r.detail}\nAnnounced release date: ${r.date} (in ${daysUntil} days)\nYou will also receive reminders at 30, 7, and 3 days, plus on release day.`
+            : stage === 0
+            ? `${r.detail}\nRelease date: ${r.date} (Today!)`
+            : `${r.detail}\nRelease date: ${r.date}\nReminder stage: ${stage} days`;
+
+        const tags =
+          stage === 0
+            ? 'popcorn,tada,clapper'
+            : isDateUpdated || stage === 'announced'
+            ? 'loudspeaker,calendar'
+            : 'movie_camera,calendar';
+
+        const response = await fetch(`${ntfyServer}/${encodeURIComponent(ntfyTopic)}`, {
+          method: 'POST',
+          headers: {
+            Title: title,
+            Tags: tags,
+            Click: r.url,
+            Priority: stage === 0 ? 'high' : 'default'
+          },
+          body
+        });
+        if (!response.ok) throw new Error(`ntfy notification failed (${response.status})`);
+        already.add(stageKey(r.id, stage));
+        alertsSent++;
+      }
     }
   }
 
