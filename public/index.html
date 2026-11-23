@@ -12,6 +12,7 @@
     .head{display:flex;justify-content:space-between;align-items:flex-start;gap:20px;flex-wrap:wrap}
     .eyebrow{color:#9b9dfd;font-size:12px;letter-spacing:.14em;text-transform:uppercase;font-weight:700}
     h1{font-size:clamp(32px,5vw,48px);line-height:1.08;margin:8px 0}
+    h2{font-size:18px;margin:34px 0 12px;color:#e2e8f0}
     p{color:#9aa8bb;margin:4px 0 0}
     .actions{display:flex;flex-direction:column;align-items:flex-end;gap:10px}
     .status{font-size:13px;color:#9aa8bb}
@@ -32,6 +33,9 @@
     .empty{padding:45px 22px;text-align:center;border:1px dashed #344056;border-radius:14px;color:#aab6c8}
     .link{color:#a9a6ff;text-decoration:none;font-size:14px;font-weight:500;white-space:nowrap}
     .link:hover{text-decoration:underline}
+    .tracked-grid{display:grid;gap:10px}
+    .tracked-row{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:13px 16px;background:#101827;border:1px solid #202d40;border-radius:12px;flex-wrap:wrap}
+    .tracked-meta{font-size:13px;color:#9aa8bb;font-variant-numeric:tabular-nums}
     .footer{margin-top:26px;font-size:12px;color:#77859a}
     @media(max-width:720px){
       .wrap{padding:24px 15px}
@@ -46,7 +50,7 @@
       <div>
         <div class="eyebrow">Your personal release calendar</div>
         <h1>Release Radar</h1>
-        <p>Cinema premieres, digital drops, seasons, and episodes — including all announced dates beyond 30 days.</p>
+        <p>Cinema premieres, digital drops, seasons, specials, and episodes — including all announced dates beyond 30 days.</p>
       </div>
       <div class="actions">
         <button class="btn" id="checkBtn" type="button">Check Releases Now</button>
@@ -65,6 +69,11 @@
 
     <section id="list" class="list"></section>
 
+    <section id="tracked-wrap" style="display:none">
+      <h2>Tracked Watchlist Status</h2>
+      <div id="tracked-list" class="tracked-grid"></div>
+    </section>
+
     <div class="footer">
       Release dates are sourced from TMDB and stored in B2 beyond 30 days as soon as announced. ntfy notifications trigger on announcement/date update, plus 30, 7, 3 days, and release day.
     </div>
@@ -72,6 +81,7 @@
 
   <script>
     let releases = [];
+    let tracked = [];
     let activeWindow = 'all';
 
     function utcToday() {
@@ -117,6 +127,26 @@
       }
     }
 
+    function renderTracked() {
+      const wrap = document.querySelector('#tracked-wrap');
+      const box = document.querySelector('#tracked-list');
+      if (!tracked.length) {
+        wrap.style.display = 'none';
+        return;
+      }
+      wrap.style.display = 'block';
+      box.innerHTML = tracked.map(t => {
+        const tmdbUrl = t.tmdbId ? `https://www.themoviedb.org/${t.kind}/${t.tmdbId}` : '';
+        return `<div class="tracked-row">
+          <div>
+            <div class="title" style="font-size:15px">${esc(t.title)}</div>
+            <div class="tracked-meta">${t.kind === 'tv' ? 'TV Series' : 'Movie'} · ${esc(t.status)}${t.tmdbId ? ` · TMDB #${t.tmdbId}` : ''}</div>
+          </div>
+          ${tmdbUrl ? `<a class="link" href="${tmdbUrl}" target="_blank" rel="noreferrer">TMDB ↗</a>` : ''}
+        </div>`;
+      }).join('');
+    }
+
     function render() {
       const todayStr = utcToday();
       updateCounts(todayStr);
@@ -139,6 +169,7 @@
             </article>`;
           }).join('')
         : `<div class="empty">No releases scheduled in this window yet.<br>Once TMDB lists upcoming dates for your tracked titles, they will appear here automatically.</div>`;
+      renderTracked();
     }
 
     function esc(s) {
@@ -161,6 +192,7 @@
         const r = await fetch('/api/releases');
         const d = await r.json();
         releases = d.releases || [];
+        tracked = d.tracked || [];
         document.querySelector('#status').textContent = d.checkedAt
           ? 'Last checked ' + new Date(d.checkedAt).toLocaleString()
           : 'Not checked yet';
@@ -181,6 +213,7 @@
         const d = await r.json();
         if (!r.ok) throw new Error(d.error || 'Check failed');
         releases = d.releases || [];
+        tracked = d.tracked || [];
         status.textContent = d.checkedAt
           ? 'Last checked ' + new Date(d.checkedAt).toLocaleString()
           : 'Check complete';

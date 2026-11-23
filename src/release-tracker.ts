@@ -6,7 +6,15 @@ type SeasonRequest = number | { seasonNumber?: number; seasonName?: string; numb
 type Show = { title?: string; name?: string; tmdbId?: number | null; tmdb_id?: number | null; seasons?: SeasonRequest[]; seasonNumber?: number; seasonName?: string };
 type Config = { region: string; ntfy?: { server?: string; topic?: string }; movies: Movie[]; shows: Show[] };
 type Release = { id: string; title: string; kind: 'cinema' | 'digital' | 'episode' | 'season'; date: string; detail: string; url: string };
-type State = { checkedAt?: string; releases: Release[]; notified: string[] };
+type TrackedStatus = {
+  title: string;
+  kind: 'movie' | 'tv';
+  tmdbId: number | null;
+  upcomingCount: number;
+  latestDate: string | null;
+  status: string;
+};
+type State = { checkedAt?: string; releases: Release[]; notified: string[]; tracked?: TrackedStatus[] };
 
 const PREFIX = 'movie-release-tracker/';
 const BUCKET = process.env.B2_BUCKET;
@@ -32,11 +40,11 @@ async function writeJson(key: string, value: unknown) {
 }
 
 export async function loadDashboard() {
-  const state = await readJson<State>('state.json', { releases: [], notified: [] });
-  return { checkedAt: state.checkedAt || null, releases: state.releases || [] };
+  const state = await readJson<State>('state.json', { releases: [], notified: [], tracked: [] });
+  return { checkedAt: state.checkedAt || null, releases: state.releases || [], tracked: state.tracked || [] };
 }
 
-function dateOnly(s?: string) {
+function dateOnly(s?: string | null) {
   return s?.slice(0, 10) || '';
 }
 
@@ -83,6 +91,10 @@ function normalizedTitle(title = '') {
   return title.toLocaleLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, ' ').trim();
 }
 
+function stripLeadingArticle(title = '') {
+  return normalizedTitle(title).replace(/^(the|a|an)\s+/, '').trim();
+}
+
 type SearchCandidate = { id: number; title?: string; original_title?: string; name?: string; original_name?: string; popularity?: number };
 
 export function chooseTitleMatch<T extends SearchCandidate>(query: string, results: T[]): T | undefined {
@@ -90,10 +102,19 @@ export function chooseTitleMatch<T extends SearchCandidate>(query: string, resul
   if (!q) return undefined;
   const exact = results.filter(item => [item.title, item.original_title, item.name, item.original_name].some(value => normalizedTitle(value || '') === q));
   if (exact.length) return exact.sort((a, b) => (b.popularity || 0) - (a.popularity || 0))[0];
+
+  const qNoArticle = stripLeadingArticle(query);
+  if (qNoArticle) {
+    const articleExact = results.filter(item =>
+      [item.title, item.original_title, item.name, item.original_name].some(value => stripLeadingArticle(value || '') === qNoArticle)
+    );
+    if (articleExact.length) return articleExact.sort((a, b) => (b.popularity || 0) - (a.popularity || 0))[0];
+  }
+
   const ranked = results
     .map(item => {
-      const names = [item.title, item.original_title, item.name, item.original_name].filter(Boolean).map(value => normalizedTitle(value!));
-      return { item, distance: Math.min(...names.map(name => editDistance(q, name))) };
+      const names = [item.title, item.original_title, item.name, item.original_name].filter(Boolean).map(value => stripLeadingArticle(value!));
+      return { item, distance: Math.min(...names.map(name => editDistance(qNoArticle || q, name))) };
     })
     .sort((a, b) => a.distance - b.distance || (b.item.popularity || 0) - (a.item.popularity || 0));
   return ranked[0]?.item;
@@ -112,10 +133,21 @@ async function ensureCatalogId(kind: 'movie' | 'tv', item: Movie | Show): Promis
     console.warn(`Skipping a ${kind} entry without a title or TMDB ID.`);
     return undefined;
   }
-  const result = kind === 'movie'
-    ? await tmdb<{ results: SearchCandidate[] }>(`/search/movie?query=${encodeURIComponent(enteredTitle)}`)
-    : await tmdb<{ results: SearchCandidate[] }>(`/search/tv?query=${encodeURIComponent(enteredTitle)}`);
-  const candidate = chooseTitleMatch(enteredTitle, result.results || []);
+  const searchQueries = [enteredTitle];
+  const withoutArticle = enteredTitle.replace(/^(the|a|an)\s+/i, '').trim();
+  if (withoutArticle && withoutArticle.toLowerCase() !== enteredTitle.toLowerCase()) {
+    searchQueries.push(withoutArticle);
+  }
+  const allResults: SearchCandidate[] = [];
+  for (const q of searchQueries) {
+    const result = kind === 'movie'
+      ? await tmdb<{ results: SearchCandidate[] }>(`/search/movie?query=${encodeURIComponent(q)}`)
+      : await tmdb<{ results: SearchCandidate[] }>(`/search/tv?query=${encodeURIComponent(q)}`);
+    for (const r of result.results || []) {
+      if (!allResults.some(x => x.id === r.id)) allResults.push(r);
+    }
+  }
+  const candidate = chooseTitleMatch(enteredTitle, allResults);
   if (!candidate) {
     console.warn(`TMDB returned no search results for one ${kind} entry; skipping it this run.`);
     return undefined;
@@ -160,22 +192,38 @@ export async function checkReleases() {
   const config = await readJson<Config>('config.json');
   const state = await readJson<State>('state.json', { releases: [], notified: [] });
   const region = (config.region || process.env.RELEASE_REGION || 'US').toUpperCase();
+  const today = new Date().toISOString().slice(0, 10);
   const found: Release[] = [];
+  const tracked: TrackedStatus[] = [];
 
   for (const m of config.movies || []) {
     // User preference: every tracked movie watches both theatrical and digital dates.
     m.releases = ['cinema', 'digital'];
     const movieId = await ensureCatalogId('movie', m);
-    if (!movieId) continue;
+    if (!movieId) {
+      tracked.push({
+        title: m.title || m.name || 'Unknown movie',
+        kind: 'movie',
+        tmdbId: null,
+        upcomingCount: 0,
+        latestDate: null,
+        status: 'No TMDB match found'
+      });
+      continue;
+    }
     const movieTitle = m.title || m.name || `Movie ${movieId}`;
     console.log('Tracking cinema and digital release dates for one movie.');
     const data = await tmdb<{ results: Array<{ iso_3166_1: string; release_dates: Array<{ release_date: string; type: number; note?: string }> }> }>(`/movie/${movieId}/release_dates`);
     const country = data.results.find(x => x.iso_3166_1 === region) || data.results.find(x => x.iso_3166_1 === 'US') || data.results[0];
+    let movieUpcoming = 0;
+    let movieLatest: string | null = null;
     for (const r of country?.release_dates || []) {
       const kind = ([2, 3].includes(r.type) ? 'cinema' : [4, 7].includes(r.type) ? 'digital' : null) as 'cinema' | 'digital' | null;
       if (!kind || (m.releases?.length && !m.releases.includes(kind))) continue;
       const date = dateOnly(r.release_date);
       if (!date) continue;
+      if (!movieLatest || date > movieLatest) movieLatest = date;
+      if (date >= today) movieUpcoming++;
       found.push({
         id: `movie-${movieId}-${kind}-${date}`,
         title: movieTitle,
@@ -185,15 +233,38 @@ export async function checkReleases() {
         url: `https://www.themoviedb.org/movie/${movieId}`
       });
     }
+    tracked.push({
+      title: movieTitle,
+      kind: 'movie',
+      tmdbId: movieId,
+      upcomingCount: movieUpcoming,
+      latestDate: movieLatest,
+      status: movieUpcoming > 0 ? `${movieUpcoming} upcoming date(s)` : movieLatest ? `Latest date ${movieLatest} (past)` : 'No release date listed on TMDB yet'
+    });
   }
 
-  for (const show of config.shows || []) {
+  for (const [idx, show] of (config.shows || []).entries()) {
     const showId = await ensureCatalogId('tv', show);
-    if (!showId) continue;
-    const info = await tmdb<{ name?: string; seasons?: TmdbSeason[] }>(`/tv/${showId}`);
+    if (!showId) {
+      tracked.push({
+        title: show.title || show.name || 'Unknown series',
+        kind: 'tv',
+        tmdbId: null,
+        upcomingCount: 0,
+        latestDate: null,
+        status: 'No TMDB match found'
+      });
+      continue;
+    }
+    const info = await tmdb<{
+      name?: string;
+      seasons?: TmdbSeason[];
+      next_episode_to_air?: { id: number; name?: string; episode_number: number; season_number: number; air_date?: string | null } | null;
+    }>(`/tv/${showId}`);
     if (info.name) show.title = info.name;
     const showTitle = show.title || show.name || `Series ${showId}`;
-    const available = (info.seasons || []).filter(s => s.season_number > 0);
+    // Include Season 0 (Specials, e.g. holiday/Christmas specials) alongside numbered seasons.
+    const available = (info.seasons || []).filter(s => s.season_number >= 0);
     const requests: SeasonRequest[] = show.seasons?.length
       ? show.seasons
       : show.seasonNumber
@@ -201,28 +272,37 @@ export async function checkReleases() {
       : available.map(s => s.season_number);
     const canonicalRequests: SeasonRequest[] = [];
     const checkedSeasonNumbers = new Set<number>();
+    let showUpcoming = 0;
+    let showLatest: string | null = null;
+
+    const recordDate = (d: string) => {
+      if (!showLatest || d > showLatest) showLatest = d;
+      if (d >= today) showUpcoming++;
+    };
 
     const collectSeason = async (sn: number, fallbackName?: string, fallbackAirDate?: string | null) => {
       const season = await tmdb<{ name?: string; air_date?: string | null; episodes?: Array<{ id: number; name: string; episode_number: number; air_date?: string }> }>(`/tv/${showId}/season/${sn}`);
-      const seasonName = season.name || fallbackName || `Season ${sn}`;
+      const seasonName = season.name || fallbackName || (sn === 0 ? 'Specials' : `Season ${sn}`);
       const firstEpisodeDate = (season.episodes || [])
         .map(ep => dateOnly(ep.air_date))
         .filter(Boolean)
         .sort()[0];
       const seasonReleaseDate = dateOnly(season.air_date || fallbackAirDate || firstEpisodeDate || undefined);
       if (seasonReleaseDate) {
+        recordDate(seasonReleaseDate);
         found.push({
           id: `season-${showId}-${sn}-${seasonReleaseDate}`,
           title: showTitle,
           kind: 'season',
           date: seasonReleaseDate,
-          detail: `Season ${sn}: ${seasonName} premiere`,
+          detail: sn === 0 ? `Specials: ${seasonName} premiere` : `Season ${sn}: ${seasonName} premiere`,
           url: `https://www.themoviedb.org/tv/${showId}/season/${sn}`
         });
       }
       for (const ep of season.episodes || []) {
         const date = dateOnly(ep.air_date);
         if (!date) continue;
+        recordDate(date);
         found.push({
           id: `episode-${ep.id}-${date}`,
           title: showTitle,
@@ -248,22 +328,48 @@ export async function checkReleases() {
       await collectSeason(sn, seasonMeta.name, seasonMeta.air_date);
     }
 
-    // A show-level watch also alerts for future premieres and episodes of seasons not selected
-    // explicitly (e.g. tracking season 1 still alerts when season 2 or 3 dates are announced).
+    // A show-level watch also alerts for future premieres, specials, and episodes of all listed seasons.
     for (const seasonMeta of available) {
       if (checkedSeasonNumbers.has(seasonMeta.season_number)) continue;
       await collectSeason(seasonMeta.season_number, seasonMeta.name, seasonMeta.air_date);
     }
 
+    // Fallback: if TMDB reports next_episode_to_air before season details update, capture it.
+    if (info.next_episode_to_air?.air_date) {
+      const nextEp = info.next_episode_to_air;
+      const date = dateOnly(nextEp.air_date);
+      const epId = `episode-${nextEp.id}-${date}`;
+      if (date && !found.some(r => r.id === epId)) {
+        recordDate(date);
+        found.push({
+          id: epId,
+          title: showTitle,
+          kind: 'episode',
+          date,
+          detail: `Season ${nextEp.season_number}, Episode ${nextEp.episode_number}: ${nextEp.name || 'Upcoming episode'}`,
+          url: `https://www.themoviedb.org/tv/${showId}/season/${nextEp.season_number}`
+        });
+      }
+    }
+
     if (show.seasons?.length) {
       show.seasons = [...new Map(canonicalRequests.map((s, i) => [typeof s === 'number' ? s : s.seasonNumber ?? s.number ?? i, s])).values()];
     }
+
+    console.log(`Show #${idx + 1}: ${available.length} TMDB season(s) checked, ${showUpcoming} upcoming date(s), latest ${showLatest || 'none'}.`);
+    tracked.push({
+      title: showTitle,
+      kind: 'tv',
+      tmdbId: showId,
+      upcomingCount: showUpcoming,
+      latestDate: showLatest,
+      status: showUpcoming > 0 ? `${showUpcoming} upcoming date(s)` : showLatest ? `Latest date ${showLatest} (past)` : 'No air date listed on TMDB yet'
+    });
   }
 
   // Write back TMDB-canonical season names and numbers alongside other B2 config.
   await writeJson('config.json', config);
 
-  const today = new Date().toISOString().slice(0, 10);
   // Keep all future releases (including > 30 days) so announced dates are tracked and shown in the app,
   // alerted immediately when announced or updated, and reminded again at 30, 7, 3, and 0 (Today) days.
   const upcoming = [...new Map(found.filter(r => r.date >= today).map(r => [r.id, r])).values()]
@@ -341,7 +447,7 @@ export async function checkReleases() {
     }
   }
 
-  const next: State = { checkedAt: new Date().toISOString(), releases: upcoming, notified: [...already].slice(-5000) };
+  const next: State = { checkedAt: new Date().toISOString(), releases: upcoming, notified: [...already].slice(-5000), tracked };
   await writeJson('state.json', next);
   console.log(`Checked ${config.movies?.length || 0} movies and ${config.shows?.length || 0} shows; ${upcoming.length} upcoming releases, ${alertsSent} reminder-stage alerts sent.`);
   return next;
