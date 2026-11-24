@@ -30,7 +30,7 @@ async function readJson<T>(key: string, fallback?: T): Promise<T> {
     const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: PREFIX + key }));
     return JSON.parse(await r.Body!.transformToString()) as T;
   } catch (e: any) {
-    if (e?.$metadata?.httpStatusCode === 404 && fallback !== undefined) return fallback;
+    if ((e?.$metadata?.httpStatusCode === 404 || e?.name === 'NoSuchKey') && fallback !== undefined) return fallback;
     throw e;
   }
 }
@@ -45,11 +45,21 @@ export async function loadDashboard() {
 }
 
 function dateOnly(s?: string | null) {
-  return s?.slice(0, 10) || '';
+  const value = s?.slice(0, 10) || '';
+  return /^\d{4}-\d{2}-\d{2}$/.test(value) ? value : '';
 }
 
 function releaseBaseKey(id: string): string {
   return id.replace(/-\d{4}-\d{2}-\d{2}$/, '');
+}
+
+function sanitizeHeader(value: string): string {
+  return value
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/[^\x20-\x7E]/g, '-')
+    .trim();
 }
 
 type TmdbSeason = { season_number: number; name: string; air_date?: string | null };
@@ -185,6 +195,186 @@ async function tmdb<T>(path: string): Promise<T> {
   return r.json() as Promise<T>;
 }
 
+type CountryReleaseBucket = {
+  iso_3166_1: string;
+  release_dates: Array<{ release_date: string; type: number; note?: string }>;
+};
+
+function mapMovieReleaseType(type: number, includePremiere = false): 'cinema' | 'digital' | null {
+  if ([2, 3].includes(type)) return 'cinema';
+  if ([4, 7].includes(type)) return 'digital';
+  if (includePremiere && type === 1) return 'cinema';
+  return null;
+}
+
+function collectMovieEntries(
+  movieId: number,
+  movieTitle: string,
+  region: string,
+  today: string,
+  allowedKinds: Array<'cinema' | 'digital'>,
+  movieInfo: { title?: string; release_date?: string | null },
+  releaseBuckets: CountryReleaseBucket[]
+): { releases: Release[]; latestDate: string | null; upcomingCount: number } {
+  const orderedCountries: CountryReleaseBucket[] = [];
+  const preferred = [region, 'US'];
+  for (const code of preferred) {
+    const match = releaseBuckets.find(x => x.iso_3166_1 === code);
+    if (match && !orderedCountries.includes(match)) orderedCountries.push(match);
+  }
+  for (const bucket of releaseBuckets) {
+    if (!orderedCountries.includes(bucket)) orderedCountries.push(bucket);
+  }
+
+  const extractFromBucket = (bucket: CountryReleaseBucket, includePremiere: boolean) => {
+    const items: Release[] = [];
+    for (const r of bucket.release_dates || []) {
+      const kind = mapMovieReleaseType(r.type, includePremiere);
+      if (!kind || (allowedKinds.length && !allowedKinds.includes(kind))) continue;
+      const date = dateOnly(r.release_date);
+      if (!date) continue;
+      items.push({
+        id: `movie-${movieId}-${kind}-${date}`,
+        title: movieTitle,
+        kind,
+        date,
+        detail:
+          r.note ||
+          (r.type === 1
+            ? `Premiere release · ${bucket.iso_3166_1}`
+            : kind === 'cinema'
+            ? `Cinema release · ${bucket.iso_3166_1}`
+            : `Digital release · ${bucket.iso_3166_1}`),
+        url: `https://www.themoviedb.org/movie/${movieId}`
+      });
+    }
+    return items;
+  };
+
+  let picked: Release[] = [];
+  // 1. Prefer the highest-priority country with upcoming cinema/digital dates (even >30 days out)
+  for (const bucket of orderedCountries) {
+    const items = extractFromBucket(bucket, false);
+    if (items.some(i => i.date >= today)) {
+      picked = items;
+      break;
+    }
+  }
+  // 2. Fallback: check Premiere (type 1) upcoming dates across ordered countries
+  if (!picked.some(i => i.date >= today)) {
+    for (const bucket of orderedCountries) {
+      const items = extractFromBucket(bucket, true);
+      if (items.some(i => i.date >= today)) {
+        picked = items;
+        break;
+      }
+    }
+  }
+  // 3. Fallback: if no upcoming dates yet in release_dates, keep historical cinema/digital from preferred country
+  if (!picked.length) {
+    for (const bucket of orderedCountries) {
+      const items = extractFromBucket(bucket, false);
+      if (items.length) {
+        picked = items;
+        break;
+      }
+    }
+  }
+  // 4. Fallback: use TMDB movie's primary release_date if no upcoming release_dates entry exists yet
+  const primaryDate = dateOnly(movieInfo.release_date);
+  if (primaryDate && (!picked.some(i => i.date >= today) || (primaryDate >= today && !picked.some(i => i.date === primaryDate)))) {
+    picked.push({
+      id: `movie-${movieId}-cinema-${primaryDate}`,
+      title: movieTitle,
+      kind: 'cinema',
+      date: primaryDate,
+      detail: 'Announced theatrical release',
+      url: `https://www.themoviedb.org/movie/${movieId}`
+    });
+  }
+
+  const deduped = [...new Map(picked.map(r => [r.id, r])).values()];
+  let latestDate: string | null = null;
+  let upcomingCount = 0;
+  for (const item of deduped) {
+    if (!latestDate || item.date > latestDate) latestDate = item.date;
+    if (item.date >= today) upcomingCount++;
+  }
+  return { releases: deduped, latestDate, upcomingCount };
+}
+
+async function syncMoviesJsonIfPresent(upcoming: Release[], notifiedSet: Set<string>, tracked: TrackedStatus[], checkedAt: string) {
+  try {
+    const store = await readJson<any>('movies.json', null);
+    if (!store || !Array.isArray(store.items)) return;
+
+    let changed = false;
+    for (const item of store.items) {
+      const isMovie = item.type === 'movie' && (item.seasonNumber === null || item.seasonNumber === undefined);
+      const tmdbId = item.tmdbId ? Number(item.tmdbId) : null;
+      const titleLower = (item.title || '').toLowerCase();
+
+      const matchingReleases = upcoming
+        .filter(r => {
+          if (tmdbId && r.url && r.url.includes(`/${isMovie ? 'movie' : 'tv'}/${tmdbId}`)) return true;
+          return r.title.toLowerCase() === titleLower;
+        })
+        .sort((a, b) => {
+          const d = a.date.localeCompare(b.date);
+          if (d !== 0) return d;
+          const rank = (k: Release['kind']) => (k === 'season' || k === 'cinema' ? 0 : k === 'digital' ? 1 : 2);
+          return rank(a.kind) - rank(b.kind);
+        });
+
+      const primary = matchingReleases[0];
+      const diag = tracked.find(
+        t => (tmdbId && t.tmdbId === tmdbId && t.kind === (isMovie ? 'movie' : 'tv')) || t.title.toLowerCase() === titleLower
+      );
+
+      if (primary) {
+        const alertStages = {
+          announced: notifiedSet.has(`${primary.id}:announced`),
+          d30: notifiedSet.has(`${primary.id}:d30`),
+          d7: notifiedSet.has(`${primary.id}:d7`) || notifiedSet.has(primary.id),
+          d3: notifiedSet.has(`${primary.id}:d3`),
+          d0: notifiedSet.has(`${primary.id}:d0`)
+        };
+        if (
+          item.releaseDate !== primary.date ||
+          item.detail !== primary.detail ||
+          item.status !== 'confirmed' ||
+          JSON.stringify(item.alertStages || {}) !== JSON.stringify(alertStages)
+        ) {
+          item.releaseDate = primary.date;
+          item.status = 'confirmed';
+          item.detail = primary.detail;
+          item.url = primary.url;
+          item.alertStages = alertStages;
+          item.updatedAt = checkedAt;
+          changed = true;
+        }
+      }
+
+      if (diag) {
+        if (item.trackedStatus !== diag.status || item.latestKnownDate !== diag.latestDate || item.upcomingCount !== diag.upcomingCount) {
+          item.trackedStatus = diag.status;
+          item.latestKnownDate = diag.latestDate;
+          item.upcomingCount = diag.upcomingCount;
+          changed = true;
+        }
+      }
+    }
+
+    if (changed) {
+      if (store.config) store.config.lastAudit = checkedAt;
+      await writeJson('movies.json', store);
+      console.log('Synchronized updated release dates to B2 movies.json.');
+    }
+  } catch (err) {
+    console.warn('Skipped optional B2 movies.json sync:', err instanceof Error ? err.message : err);
+  }
+}
+
 export async function checkReleases() {
   if (!BUCKET || !process.env.B2_ENDPOINT || !process.env.B2_KEY_ID || !process.env.B2_APPLICATION_KEY) {
     throw new Error('Configure B2_BUCKET, B2_ENDPOINT, B2_KEY_ID and B2_APPLICATION_KEY');
@@ -196,7 +386,7 @@ export async function checkReleases() {
   const found: Release[] = [];
   const tracked: TrackedStatus[] = [];
 
-  for (const m of config.movies || []) {
+  for (const [idx, m] of (config.movies || []).entries()) {
     // User preference: every tracked movie watches both theatrical and digital dates.
     m.releases = ['cinema', 'digital'];
     const movieId = await ensureCatalogId('movie', m);
@@ -211,28 +401,23 @@ export async function checkReleases() {
       });
       continue;
     }
+    const [movieInfo, releaseDatesData] = await Promise.all([
+      tmdb<{ title?: string; release_date?: string | null }>(`/movie/${movieId}`),
+      tmdb<{ results: CountryReleaseBucket[] }>(`/movie/${movieId}/release_dates`)
+    ]);
+    if (movieInfo.title) m.title = movieInfo.title;
     const movieTitle = m.title || m.name || `Movie ${movieId}`;
-    console.log('Tracking cinema and digital release dates for one movie.');
-    const data = await tmdb<{ results: Array<{ iso_3166_1: string; release_dates: Array<{ release_date: string; type: number; note?: string }> }> }>(`/movie/${movieId}/release_dates`);
-    const country = data.results.find(x => x.iso_3166_1 === region) || data.results.find(x => x.iso_3166_1 === 'US') || data.results[0];
-    let movieUpcoming = 0;
-    let movieLatest: string | null = null;
-    for (const r of country?.release_dates || []) {
-      const kind = ([2, 3].includes(r.type) ? 'cinema' : [4, 7].includes(r.type) ? 'digital' : null) as 'cinema' | 'digital' | null;
-      if (!kind || (m.releases?.length && !m.releases.includes(kind))) continue;
-      const date = dateOnly(r.release_date);
-      if (!date) continue;
-      if (!movieLatest || date > movieLatest) movieLatest = date;
-      if (date >= today) movieUpcoming++;
-      found.push({
-        id: `movie-${movieId}-${kind}-${date}`,
-        title: movieTitle,
-        kind,
-        date,
-        detail: r.note || (kind === 'cinema' ? `Cinema release · ${country?.iso_3166_1 || region}` : `Digital release · ${country?.iso_3166_1 || region}`),
-        url: `https://www.themoviedb.org/movie/${movieId}`
-      });
-    }
+    const { releases: movieReleases, latestDate: movieLatest, upcomingCount: movieUpcoming } = collectMovieEntries(
+      movieId,
+      movieTitle,
+      region,
+      today,
+      m.releases,
+      movieInfo,
+      releaseDatesData.results || []
+    );
+    found.push(...movieReleases);
+    console.log(`Movie #${idx + 1}: ${movieUpcoming} upcoming date(s), latest ${movieLatest || 'none'}.`);
     tracked.push({
       title: movieTitle,
       kind: 'movie',
@@ -259,11 +444,11 @@ export async function checkReleases() {
     const info = await tmdb<{
       name?: string;
       seasons?: TmdbSeason[];
-      next_episode_to_air?: { id: number; name?: string; episode_number: number; season_number: number; air_date?: string | null } | null;
+      next_episode_to_air?: { id: number; name?: string; season_number: number; episode_number: number; air_date?: string | null } | null;
     }>(`/tv/${showId}`);
     if (info.name) show.title = info.name;
     const showTitle = show.title || show.name || `Series ${showId}`;
-    // Include Season 0 (Specials, e.g. holiday/Christmas specials) alongside numbered seasons.
+    // Include Season 0 (Specials) as well as regular seasons.
     const available = (info.seasons || []).filter(s => s.season_number >= 0);
     const requests: SeasonRequest[] = show.seasons?.length
       ? show.seasons
@@ -433,7 +618,7 @@ export async function checkReleases() {
         const response = await fetch(`${ntfyServer}/${encodeURIComponent(ntfyTopic)}`, {
           method: 'POST',
           headers: {
-            Title: title,
+            Title: sanitizeHeader(title),
             Tags: tags,
             Click: r.url,
             Priority: stage === 0 ? 'high' : 'default'
@@ -447,8 +632,10 @@ export async function checkReleases() {
     }
   }
 
-  const next: State = { checkedAt: new Date().toISOString(), releases: upcoming, notified: [...already].slice(-5000), tracked };
+  const checkedAt = new Date().toISOString();
+  const next: State = { checkedAt, releases: upcoming, notified: [...already].slice(-5000), tracked };
   await writeJson('state.json', next);
+  await syncMoviesJsonIfPresent(upcoming, already, tracked, checkedAt);
   console.log(`Checked ${config.movies?.length || 0} movies and ${config.shows?.length || 0} shows; ${upcoming.length} upcoming releases, ${alertsSent} reminder-stage alerts sent.`);
   return next;
 }
